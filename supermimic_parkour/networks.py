@@ -131,7 +131,12 @@ class Policy(nn.Module):
         self.register_buffer("goal_scale", goal_scale(goal_dim))
 
     def forward(self, obs_hist, goal):
-        z = torch.tanh(run_mlp(self.enc, goal * self.goal_scale))
+        return self.decode(obs_hist, self.encode(goal))
+
+    def encode(self, goal):
+        return torch.tanh(run_mlp(self.enc, goal * self.goal_scale))
+
+    def decode(self, obs_hist, z):
         # Keep the PHP history layout (oldest frame first) in collect and imagine.
         return run_mlp(
             self.dec, torch.cat((z, (obs_hist * self.obs_scale).flatten(-2)), -1)

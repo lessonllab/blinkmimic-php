@@ -1,0 +1,5 @@
+{
+  "repository": "https://github.com/fuyichen0725/blinkmimic",
+  "revision": "d264658d6c9ce61fb52f9f0f8985a369f3ccc409",
+  "modifications": "PHP motion/terrain adapter; see PHP_PORT.md"
+}

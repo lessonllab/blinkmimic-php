@@ -94,6 +94,7 @@ class MotionLibrary:
         device="cpu",
         *,
         require_velocity=False,
+        terrain_files=None,
     ):
         self.paths = tuple(paths)
         if not paths:
@@ -108,8 +109,15 @@ class MotionLibrary:
         )
         parts = {key: [] for key in keys}
         velocity_parts = []
-        lengths, terrains, fps_values = [], [], []
-        for path in paths:
+        lengths, terrains, faces_list, fps_values = [], [], [], []
+        self.terrain_files = tuple(terrain_files) if terrain_files is not None else tuple(p.with_name(p.name.replace('_motion.npz','_terrain.npy')) for p in paths)
+        if len(self.terrain_files)!=len(paths):
+            raise ValueError('Motion/terrain pair counts differ')
+        mesh_mode = [p.name.endswith('_terrain_mesh.npz') for p in self.terrain_files]
+        if any(mesh_mode) and not all(mesh_mode):
+            raise ValueError('Mixed terrain representations are not supported')
+        self.terrain_format = 'vertices' if all(mesh_mode) else 'obb'
+        for path, terrain_file in zip(paths, self.terrain_files):
             with np.load(path, allow_pickle=False) as src:
                 required = set(keys) | {"fps", "joint_names", "body_names"}
                 if required - set(src.files):
@@ -177,7 +185,17 @@ class MotionLibrary:
                             raise ValueError(f"Zero quaternion in {path}")
                         value = value / norms
                     parts[key].append(value.astype(np.float32))
-            terrains.append(read_terrain(path))
+            if self.terrain_format == 'vertices':
+                with np.load(terrain_file,allow_pickle=False) as src:
+                    vertices, faces = src['vertices'], src['faces']
+                if vertices.ndim != 4 or vertices.shape[2:] != (8,3) or vertices.shape[1] < 1 or not np.isfinite(vertices).all():
+                    raise ValueError(f'Invalid terrain vertices: {terrain_file}')
+                if faces.shape != (*vertices.shape[:2],12,3) or np.any((faces<0)|(faces>7)):
+                    raise ValueError(f'Invalid terrain faces: {terrain_file}')
+                terrains.append(vertices.reshape(*vertices.shape[:2],24).astype(np.float32))
+                faces_list.append(faces.astype(np.int32))
+            else:
+                terrains.append(read_terrain(path))
         if not np.allclose(fps_values, fps_values[0]):
             raise ValueError("All PHP clips in a teacher must have the same FPS")
         self.fps = fps_values[0]
@@ -198,13 +216,22 @@ class MotionLibrary:
         # A locomotion-only teacher still has one hidden slot, for the same scene contract.
         self.max_boxes = max(1, max(b.shape[0] for b in terrains))
         padded = np.zeros(
-            (len(paths), max(b.shape[1] for b in terrains), self.max_boxes, 10),
+            (len(paths), max(b.shape[1] for b in terrains), self.max_boxes, 24 if self.terrain_format=='vertices' else 10),
             np.float32,
         )
-        padded[..., 2], padded[..., 3], padded[..., 7:] = -50, 1, 0.02
+        if self.terrain_format == 'vertices':
+            padded.reshape(*padded.shape[:-1],8,3)[...,2] = -50
+            face_pad = np.zeros((*padded.shape[:-1],12,3),np.int32)
+        else:
+            padded[..., 2], padded[..., 3], padded[..., 7:] = -50, 1, 0.02
         for i, boxes in enumerate(terrains):
             padded[i, : boxes.shape[1], : boxes.shape[0]] = boxes.transpose(1, 0, 2)
+            if self.terrain_format == 'vertices':
+                face_pad[i,:boxes.shape[1],:boxes.shape[0]] = faces_list[i].transpose(1,0,2,3)
         self.terrain = torch.as_tensor(padded, device=device)
+        if self.terrain_format == 'vertices':
+            self.terrain_vertices_np = padded.reshape(*padded.shape[:-1],8,3)
+            self.terrain_faces_np = face_pad
         # One-second bins stop at clip boundaries, including the final partial bin.
         bin_starts, bin_sizes, bin_clips = [], [], []
         start = 0

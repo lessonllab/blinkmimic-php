@@ -104,6 +104,11 @@ def main():
         "--no_compile", action="store_true", help="Disable torch.compile for debugging"
     )
     parser.add_argument(
+        "--fast", action="store_true",
+        help="fused Adam with device-side finite checks, batched goal encoding, compiled critic/GAE, batched metric reads",
+    )
+    parser.add_argument('--wm-cuda-graph', action='store_true', help='capture world-model updates (requires --fast, single GPU)')
+    parser.add_argument(
         "--strict-numerics", action="store_true",
         help="Stop on isolated non-finite simulator transitions instead of resetting them",
     )
@@ -125,6 +130,7 @@ def main():
 
     import torch
     import torch.nn as nn
+    from .acceleration import configure_adam, finite_adam_step, sum_metrics, GraphedUpdate
 
     from supermimic_parkour.buffer import ReplayBuffer
     from supermimic_parkour.distributed import DistributedContext
@@ -172,6 +178,8 @@ def main():
     if not dev.startswith("cuda"):
         networks.AMP_DTYPE = None
         args.amp = "none"
+        if args.fast:
+            parser.error("--fast requires CUDA")
     if (
         min(
             args.num_envs,
@@ -224,6 +232,8 @@ def main():
     args.global_num_envs = args.num_envs * distributed.world_size
     args.global_wm_batch = args.wm_batch * distributed.world_size
     args.global_pi_batch = args.pi_batch * distributed.world_size
+    if args.wm_cuda_graph and (not args.fast or distributed.enabled):
+        parser.error('--wm-cuda-graph requires --fast and a single worker')
     if distributed.is_main:
         os.makedirs(args.log_dir, exist_ok=True)
         print(
@@ -274,9 +284,9 @@ def main():
     ).to(dev)
     pi = Policy(OBS_DIM, GOAL_DIM, hist=Hh, hidden=tuple(args.policy_hidden)).to(dev)
     critic = Critic(CRITIC_IN, hidden=tuple(args.critic_hidden)).to(dev)
-    opt_wm = torch.optim.Adam(wm.parameters(), lr=args.lr)
-    opt_pi = torch.optim.Adam(pi.parameters(), lr=args.lr, betas=(0.9, 0.95))
-    opt_v = torch.optim.Adam(critic.parameters(), lr=args.lr)
+    opt_wm = torch.optim.Adam(wm.parameters(), lr=args.lr, fused=args.fast)
+    opt_pi = torch.optim.Adam(pi.parameters(), lr=args.lr, betas=(0.9, 0.95), fused=args.fast)
+    opt_v = torch.optim.Adam(critic.parameters(), lr=args.lr, fused=args.fast)
     start_it, wall_offset, sim_steps = 0, 0.0, 0
     gpu_offset = 0.0
     num_updates, update_acc = 0, 0.0
@@ -331,6 +341,12 @@ def main():
         )
         gpu_offset = ck.get("gpu_time", wall_offset * old_gpu_count)
 
+    for optimizer in (opt_wm, opt_pi, opt_v):
+        configure_adam(optimizer, fused=args.fast, capturable=args.wm_cuda_graph and optimizer is opt_wm)
+    skipped_updates = torch.zeros(3, device=dev, dtype=torch.long)
+    if args.fast:
+        print("[fast] fused Adam, device-side finite gates, batched goals, compiled critic/GAE", flush=True)
+
     if args.iterations <= start_it:
         parser.error("--iterations must exceed the resumed checkpoint iteration")
     if distributed.is_main:
@@ -372,6 +388,16 @@ def main():
         o_hist = torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1)
         return S1, a, o_hist, f1, motion.goal(f1, K)
 
+    def _imag_step_encoded(S, o_hist, f, xi, xi_n, z):
+        a = pi.decode(o_hist, z)
+        S1 = wm.step(S, a.clamp(-20.0, 20.0), xi_n)
+        f1 = f + 1
+        o1 = mdp.add_noise(mdp.obs(S1, a, xi, f1))
+        return S1, a, torch.cat((o_hist[:, 1:], o1.unsqueeze(1)), 1), f1
+
+    def _critic_loss(x, y):
+        return ((critic(x) - y) ** 2).mean()
+
     def _reward_term(S, f, a, a_prev):
         return mdp.reward(S, f, a, a_prev), torch.sigmoid(
             wm.termination_logits(mdp.termination_errors(S, f))
@@ -386,6 +412,10 @@ def main():
     imag_step = compile_fn(_imag_step)
     reward_term = compile_fn(_reward_term)
     critic_input_c = compile_fn(_critic_input)
+    imag_step_encoded = compile_fn(_imag_step_encoded) if args.fast else None
+    encode_goals = compile_fn(pi.encode) if args.fast else None
+    critic_loss = compile_fn(_critic_loss) if args.fast else _critic_loss
+    gae_targets_c = compile_fn(gae_targets) if args.fast else gae_targets
 
     def lr_at(it: int) -> float:
         return cosine_lr(it, args.lr_decay_iters, args.effective_lr, decay_fraction=1.0)
@@ -395,8 +425,9 @@ def main():
             p.requires_grad_(flag)
 
     # ------------------------------------------------------------------------------------------------
-    def wm_update():
-        w = buffer.sample_windows(args.wm_batch, args.wm_window)
+    def wm_update(w=None):
+        if w is None:
+            w = buffer.sample_windows(args.wm_batch, args.wm_window)
         S_hat = wm_rollout(w["s"], w["a"], w["xi"])
         loss, errors, term_sum = wm_err(
             S_hat, w["s1"], w["mask"], w["f"], w["term"]
@@ -405,7 +436,9 @@ def main():
         loss.backward()
         distributed.sync_gradients(wm)
         gn = nn.utils.clip_grad_norm_(wm.parameters(), 1.0)
-        if torch.isfinite(gn):
+        if args.fast:
+            finite_adam_step(opt_wm, gn, skipped_updates[0])
+        elif torch.isfinite(gn):
             opt_wm.step()
         m = w["mask"][:, -1]
         # Log fixed-scale state NSE over valid
@@ -417,6 +450,8 @@ def main():
             m.sum(),
             term_sum.detach(),
         )
+
+    wm_graphed = GraphedUpdate(wm_update, wm, opt_wm, (skipped_updates,)) if args.wm_cuda_graph else None
 
     def sample_valid_starts(B: int):
         starts, hists, n = [], [], 0
@@ -461,13 +496,24 @@ def main():
         B = args.pi_batch
         g0 = motion.goal(f, K)
         g = g0
+        if args.fast:
+            # Goals depend only on reference frames, not on imagined states.
+            # Encode H+1 frames in one call; keep encoder gradients intact.
+            goal_frames = (f[None] + torch.arange(HZ + 1, device=dev)[:, None]).flatten()
+            goals = motion.goal(goal_frames, K).view(HZ + 1, B, -1)
+            latents = encode_goals(goals[:-1].flatten(0, 1)).view(HZ, B, -1)
+            g0 = g = goals[0]
         S0 = S
         Ss, As, Aps, Fs, Gs = [], [], [], [], []
         for t in range(HZ):
             Aps.append(a_prev)
-            S, a_prev, o_hist, f, g = imag_step(
-                S, o_hist, a_prev, f, xi, xi_n, g
-            )
+            if args.fast:
+                S, a_prev, o_hist, f = imag_step_encoded(S, o_hist, f, xi, xi_n, latents[t])
+                g = goals[t + 1]
+            else:
+                S, a_prev, o_hist, f, g = imag_step(
+                    S, o_hist, a_prev, f, xi, xi_n, g
+                )
             Ss.append(S), As.append(a_prev), Fs.append(f), Gs.append(g)
         flat = lambda xs: torch.stack(xs).flatten(0, 1)  # noqa: E731  (H*B, ...)
         S_all = tuple(flat([St[i] for St in Ss]) for i in range(6))
@@ -495,7 +541,9 @@ def main():
         distributed.sync_gradients(pi)
         gn = nn.utils.clip_grad_norm_(pi.parameters(), 1.0)
         nn.utils.clip_grad_value_(pi.parameters(), 0.1)
-        if torch.isfinite(gn):
+        if args.fast:
+            finite_adam_step(opt_pi, gn, skipped_updates[1])
+        elif torch.isfinite(gn):
             opt_pi.step()
         set_requires_grad(wm, True)
         set_requires_grad(critic, True)
@@ -523,21 +571,23 @@ def main():
                 X = critic_input_c(S_c, f_c, xi_c, g_c, ap_c).view(HZ + 1, B, -1)
             with torch.no_grad():
                 V = critic(X)
-                targets = gae_targets(rews, dones, V, args.gamma, args.lam)
+                targets = gae_targets_c(rews, dones, V, args.gamma, args.lam)
             Xf, Yf = X[:-1].reshape(-1, X.shape[-1]), targets.reshape(-1)
             n = Xf.shape[0]
             for _ in range(args.critic_epochs):
                 perm = torch.randperm(n, device=dev)
                 for i in range(args.critic_minibatches):
                     idx = torch.tensor_split(perm, args.critic_minibatches)[i]
-                    v_loss = ((critic(Xf[idx]) - Yf[idx]) ** 2).mean()
+                    v_loss = critic_loss(Xf[idx], Yf[idx])
                     v_loss_sum += v_loss.detach() * idx.numel()
                     v_count += idx.numel()
                     opt_v.zero_grad(set_to_none=True)
                     v_loss.backward()
                     distributed.sync_gradients(critic)
                     gn_v = nn.utils.clip_grad_norm_(critic.parameters(), 1.0)
-                    if torch.isfinite(gn_v):
+                    if args.fast:
+                        finite_adam_step(opt_v, gn_v, skipped_updates[2])
+                    elif torch.isfinite(gn_v):
                         opt_v.step()
         if PROFILE:
             torch.cuda.synchronize()
@@ -573,7 +623,8 @@ def main():
             env.bin_G.copy_(sampling_state["bin_G"])
             env.bin_w_avg.copy_(sampling_state["bin_w_avg"])
         buffer = ReplayBuffer(
-            args.buffer_steps, args.num_envs, dev, context_dim=motion.context_dim
+            args.buffer_steps, args.num_envs, dev, context_dim=motion.context_dim,
+            track_validity=args.fast,
         )
         obs_hist = torch.zeros(args.num_envs, Hh, OBS_DIM, device=dev)
 
@@ -593,8 +644,9 @@ def main():
                 a = clean_action
                 if args.action_noise:
                     a = a + args.action_noise * torch.randn_like(a)
+                failures_before = env.numerical_failures
                 out = env.step(a.clamp(-20.0, 20.0), clean_action=clean_action)
-                buffer.add(out)
+                buffer.add(out, all_valid=env.numerical_failures == failures_before)
                 sim_steps += args.global_num_envs
                 stats["r"].append(out["r"].mean() / MAX_STEP_REWARD)
                 if "ep_len" in out:
@@ -667,7 +719,10 @@ def main():
             lr = lr_at(it + 1)
             for o in (opt_wm, opt_pi, opt_v):
                 for gparam in o.param_groups:
-                    gparam["lr"] = lr
+                    if torch.is_tensor(gparam['lr']):
+                        gparam['lr'].fill_(lr)
+                    else:
+                        gparam["lr"] = lr
             collect(1, stats)
             collection_steps += 1
             if collection_steps >= args.warmup_steps:
@@ -676,7 +731,8 @@ def main():
                     update_acc = max(0.0, update_acc - 1.0)
                     for _ in range(args.wm_batches):
                         error_sum, valid_steps, error8_sum, valid_windows, term_sum = (
-                            wm_update()
+                            wm_graphed(buffer.sample_windows(args.wm_batch, args.wm_window))
+                            if wm_graphed is not None and num_updates >= 2 else wm_update()
                         )
                         agg["wm"].append((error_sum, valid_steps))
                         agg["wm8"].append((error8_sum, valid_windows))
@@ -689,7 +745,7 @@ def main():
                             agg[key].append((value, 1))
                     num_updates += 1
             if (it + 1) % args.log_every == 0:
-                total = lambda x: sum(float(v) for v in x)  # noqa: E731
+                total = lambda x: sum_metrics(x, dev)  # noqa: E731
                 # Reduce sums/counts so workers with few completed episodes are not
                 # weighted as heavily as those with many completed episodes.
                 keys = list(agg)
@@ -793,12 +849,16 @@ def main():
                     mask = ids == skill
                     skill_stats.extend(
                         (
-                            mask.sum().item(),
-                            returns[mask].sum().item(),
-                            failures[mask].sum().item(),
+                            mask.sum(),
+                            torch.where(mask, returns, 0.0).sum(),
+                            torch.where(mask, failures, 0.0).sum(),
                         )
                     )
                 skill_stats = distributed.sum_values(skill_stats)
+                if args.fast and distributed.is_main:
+                    skipped = skipped_updates.tolist()
+                    if any(skipped):
+                        print(f"[fast] skipped nonfinite updates (wm, pi, critic): {skipped}", flush=True)
                 if distributed.is_main:
                     with (Path(args.log_dir) / "skills.csv").open("a") as stream:
                         for i, name in enumerate(motion.skill_names):

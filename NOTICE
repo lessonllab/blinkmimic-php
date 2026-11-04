@@ -27,3 +27,17 @@ All rights reserved.
 
 No source training checkpoints or logs are included. Upstream experiment
 results do not establish the performance of this standalone adaptation.
+
+Optional fast execution (2026-11-03) adapts the fused-Adam finite-update gate
+and batched-goal encoding approach of BlinkMimic / InstantTrack to the PHP
+training loop. Source: https://github.com/fuyichen0725/blinkmimic
+Inspected revision: d264658d6c9ce61fb52f9f0f8985a369f3ccc409.
+Copyright (c) 2026 Fuyi Chen and Huy-Quang-Dao.
+The corresponding MIT notice is retained in doc/BlinkMimic-LICENSE.
+
+Full BlinkMimic PHP port (2026-11-03): the package blinkmimic/ is derived from
+the same upstream revision above, retaining its training method and original
+MIT/third-party notices in blinkmimic/LICENSE and THIRD_PARTY_NOTICES.md.
+PHP NPZ/terrain/task adapters and explicit runtime overrides are documented
+in blinkmimic/PHP_PORT.md. Upstream benchmark results are not results of this
+PHP adaptation.

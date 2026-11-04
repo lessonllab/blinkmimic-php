@@ -115,7 +115,9 @@ class DistributedContext:
         )
 
     def sum_values(self, values):
-        tensor = torch.tensor(values, device=self.device, dtype=torch.float64)
+        tensor = torch.stack([
+            torch.as_tensor(v, device=self.device, dtype=torch.float64) for v in values
+        ])
         if self.enabled:
             dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
         return tensor.tolist()

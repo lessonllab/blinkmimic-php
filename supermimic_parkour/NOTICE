@@ -11,3 +11,9 @@ SuperMimic code or a claim of matching its published results.
 
 Revised algorithm migration: see core/NOTICE and core/LICENSE for the additional
 SuperMimic-Reproduced attribution. Legacy v2 networks remain for playback only.
+
+Optional fast execution adapts BlinkMimic / InstantTrack execution techniques
+(fused-Adam finite gates and batched reference encoding) to the PHP loop.
+Source: https://github.com/fuyichen0725/blinkmimic
+Inspected revision d264658d6c9ce61fb52f9f0f8985a369f3ccc409.
+Copyright (c) 2026 Fuyi Chen and Huy-Quang-Dao; MIT (see LICENSE).

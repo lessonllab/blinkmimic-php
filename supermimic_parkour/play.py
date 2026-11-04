@@ -160,9 +160,9 @@ def main():
                             "参考不透明度", min=0.1, max=1.0, step=0.05, initial_value=0.5
                         )
                 with tabs.add_tab("视角与显示", icon=viser.Icon.SETTINGS):
-                    comparison.scene.create_visualization_gui(
+                    comparison.scene.create_scene_gui(
                         camera_distance=4.0, camera_azimuth=135.0,
-                        camera_elevation=-25.0, show_debug_viz_control=False,
+                        camera_elevation=25.0, show_debug_viz_control=False,
                     )
 
                 @skill_selection.on_update

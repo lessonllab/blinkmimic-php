@@ -3,6 +3,8 @@
 from pathlib import Path
 import math
 import warnings
+import json
+import hashlib
 
 import numpy as np
 import torch
@@ -45,27 +47,54 @@ class MotionLib:
     ):
         if max_clips_per_skill < 0:
             raise ValueError("max_clips_per_skill must be nonnegative")
-        self.skill_names = tuple(skills)
+        root = Path(directory).expanduser().resolve()
+        collection_path = root/'collection_manifest.json'
+        collection = json.loads(collection_path.read_text()) if collection_path.exists() else None
+        self.skill_names = tuple(skills if skills is not None else collection['skills'] if collection else DEFAULT_SKILLS)
+        bundles = BUNDLES if collection is None else {s:s for s in collection['skills']}
         if not self.skill_names or len(set(self.skill_names)) != len(self.skill_names):
             raise ValueError("Skills must be a nonempty list without duplicates")
-        if any(name not in BUNDLES for name in self.skill_names):
+        if any(name not in bundles for name in self.skill_names):
             raise ValueError(f"Unknown PHP skills: {self.skill_names}")
-        weights = [SKILL_SAMPLING_WEIGHTS[name] for name in self.skill_names]
+        weights = [SKILL_SAMPLING_WEIGHTS[name] if collection is None else 1. for name in self.skill_names]
         if any(not math.isfinite(w) or w < 0 for w in weights):
             raise ValueError("Skill sampling weights must be finite and nonnegative")
         total_weight = sum(weights)
         if not math.isfinite(total_weight) or total_weight <= 0:
             raise ValueError("Selected skills must have a positive finite total weight")
         self.skill_probabilities = tuple(w / total_weight for w in weights)
-        paths, skill_ids = [], []
-        for i, name in enumerate(self.skill_names):
-            folder = BUNDLES[name]
-            selected = motion_paths(str(Path(directory).expanduser() / folder))
-            if max_clips_per_skill:
-                selected = selected[:max_clips_per_skill]
-            paths.extend(selected)
-            skill_ids.extend([i] * len(selected))
-        self.library = m = MotionLibrary(paths, G1_JOINT_NAMES, device=device)
+        paths, skill_ids, terrain_files = [], [], []
+        self.collection_manifest = collection
+        self.entry_fraction = .25 if collection else 0.
+        self.collection_rows = []
+        if collection:
+            if collection.get('format') != 'php_reference_collection_v1':
+                raise ValueError('Unsupported PHP collection contract')
+            rows = [r for r in collection['active'] if r['skill'] in self.skill_names]
+            for row in rows:
+                if row['cohort'] not in ('original550','repaired69'):
+                    raise ValueError('Quarantined/non-active data is not trainable')
+                path, terrain = root/row['path'], root/row['terrain']
+                if not path.resolve().is_relative_to(root) or not terrain.resolve().is_relative_to(root):
+                    raise ValueError('Collection path escapes dataset root')
+                for file, expected in ((path,row['sha256']),(terrain,row['terrain_sha256'])):
+                    with file.open('rb') as stream: actual=hashlib.file_digest(stream,'sha256').hexdigest()
+                    if actual != expected: raise ValueError(f'Collection checksum mismatch: {file}')
+                paths.append(path);terrain_files.append(terrain)
+                skill_ids.append(self.skill_names.index(row['skill']))
+            if len(rows)!=len(set(r['source_motion_id'] for r in rows)):
+                raise ValueError('Duplicate collection source motion IDs')
+            self.collection_rows = rows
+        else:
+            for i, name in enumerate(self.skill_names):
+                selected = motion_paths(str(root / bundles[name]))
+                if max_clips_per_skill: selected = selected[:max_clips_per_skill]
+                paths.extend(selected)
+                skill_ids.extend([i] * len(selected))
+        self.library = m = MotionLibrary(paths, G1_JOINT_NAMES, device=device,terrain_files=terrain_files if collection else None)
+        if collection and m.time_step_total!=sum(r['frames'] for r in self.collection_rows):
+            raise ValueError('Collection frame count differs from the indexed per-clip contract')
+        self.terrain_format = m.terrain_format
         if not np.isclose(m.fps * CONTROL_DT, 1.0):
             raise ValueError(f"Expected PHP motions at 50 Hz, got {m.fps}")
         self.paths = m.paths
@@ -105,6 +134,7 @@ class MotionLib:
         )
         self.max_boxes = m.max_boxes
         self.terrain = m.terrain
+        self.terrain_files = m.terrain_files
         self.variant_counts = m.variant_counts
         self.box_counts = m.box_counts
         self.context_dim = 33 + 10 * self.max_boxes

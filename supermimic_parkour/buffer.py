@@ -23,7 +23,7 @@ FIELDS = {
 
 
 class ReplayBuffer:
-    def __init__(self, T: int, N: int, device: str, context_dim: int = XI_DIM):
+    def __init__(self, T: int, N: int, device: str, context_dim: int = XI_DIM, *, track_validity=False):
         self.T, self.N, self.device = T, N, device
         self.data = {}
         self.fields = dict(FIELDS, xi=(context_dim, torch.float32))
@@ -31,12 +31,20 @@ class ReplayBuffer:
             shp = (T, N) + ((shape,) if isinstance(shape, int) else shape)
             self.data[k] = torch.zeros(shp, dtype=dt, device=device)
         self.ptr, self.size = 0, 0
+        self.track_validity = track_validity
+        self.add_count, self.invalid_until = 0, 0
 
-    def add(self, tr: dict):
+    def add(self, tr: dict, *, all_valid=None):
         for k in self.fields:
             self.data[k][self.ptr] = tr.get("valid", True) if k == "valid" else tr[k]
         self.ptr = (self.ptr + 1) % self.T
         self.size = min(self.size + 1, self.T)
+        self.add_count += 1
+        # Only a simulator-side certificate can bypass validity rejection.
+        # Unknown or invalid rows force the original safe sampler until they
+        # have completely aged out of the replay ring.
+        if all_valid is not True:
+            self.invalid_until = self.add_count + self.T
 
     def _row(self, age: torch.Tensor) -> torch.Tensor:
         """Map age-ordered time index (0 = oldest) to the storage row."""
@@ -47,6 +55,8 @@ class ReplayBuffer:
             raise ValueError("Not enough replay steps to sample")
         age = torch.randint(0, stop, (B,), device=self.device)
         env = torch.randint(0, self.N, (B,), device=self.device)
+        if self.track_validity and self.add_count >= self.invalid_until:
+            return age, env
         for _ in range(8):
             bad = ~self.data["valid"][self._row(age), env]
             if not bool(bad.any()):

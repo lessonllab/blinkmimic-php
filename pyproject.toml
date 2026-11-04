@@ -9,10 +9,10 @@ description = "Standalone SuperMimic training for PHP parkour motions on MJLab"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "mjlab==1.2.0",
-    "mujoco==3.5.0",
-    "mujoco-warp==3.5.0",
-    "warp-lang==1.12.1",
+    "mjlab==1.6.0",
+    "mujoco==3.11.0",
+    "mujoco-warp==3.11.0",
+    "warp-lang==1.16.0",
     "torch>=2.7",
     "numpy",
     "tensorboard",
@@ -23,13 +23,16 @@ viewer = ["viser"]
 test = ["pytest"]
 
 [project.scripts]
-supermimic-train = "supermimic_parkour.launcher:main"
-supermimic-play = "supermimic_parkour.play:main"
-supermimic-evaluate = "supermimic_parkour.evaluate:main"
+supermimic-train = "blinkmimic.php.recipe:main"
+supermimic-train-legacy = "supermimic_parkour.launcher:main"
+supermimic-play = "blinkmimic.php.play:main"
+supermimic-evaluate = "blinkmimic.php.evaluate:main"
+supermimic-play-legacy = "supermimic_parkour.play:main"
+supermimic-evaluate-legacy = "supermimic_parkour.evaluate:main"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["supermimic_parkour", "supermimic_parkour.*"]
+include = ["supermimic_parkour", "supermimic_parkour.*", "blinkmimic", "blinkmimic.*"]
 namespaces = false
 
 [tool.setuptools]
@@ -41,6 +44,7 @@ supermimic_parkour = [
     "assets/g1/xmls/assets/*.STL", "assets/g1/xmls/assets/*.obj",
 ]
 "supermimic_parkour.core" = ["LICENSE", "NOTICE"]
+"blinkmimic" = ["LICENSE", "THIRD_PARTY_NOTICES.md", "UPSTREAM.json", "PHP_PORT.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
